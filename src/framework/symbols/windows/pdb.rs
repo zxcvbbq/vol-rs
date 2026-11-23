@@ -85,10 +85,11 @@ pub fn fetch(name: &str, guid: &str, age: u32) -> Result<Vec<u8>> {
         return Ok(data);
     }
 
-    // The server may be somewhere else entirely.
-    let server = crate::framework::cache::remote_url()
-        .unwrap_or_else(|| SYMBOL_SERVER.to_string());
-    let url = format!("{server}/{file}/{identifier}/{file}");
+    // The database always comes from Microsoft's server. It used to consult
+    // the remote index URL here, but that names a list of symbol files rather
+    // than a place databases are kept, so pointing one at the other produced a
+    // URL that could only 404.
+    let url = format!("{SYMBOL_SERVER}/{file}/{identifier}/{file}");
     log::debug!("Fetching {url}");
     let mut response = ureq::get(&url)
         .call()

@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::framework::automagic::image_cache;
+use crate::framework::automagic::remote_isf::{self, RemoteIndex};
 use crate::framework::automagic::symbol_finder::{first_known_banner, BannerIndex, FoundBanner};
 use crate::framework::layers::scanners::{scan_layer_until, RegExScanner};
 use crate::framework::automagic::DetectedOs;
@@ -44,7 +45,35 @@ pub fn detect(
     let started = std::time::Instant::now();
     let index = BannerIndex::build(finder, "linux");
     log::debug!("Indexing symbol files took {:?}", started.elapsed());
-    if index.is_empty() {
+
+    // A public index of symbol files, when one was named. A published index
+    // carries tens of thousands of entries for distribution versions nobody
+    // has installed, so it is consulted only once a banner has been found that
+    // nothing on disk describes.
+    let remote = match crate::framework::cache::remote_url() {
+        Some(url) if !crate::framework::cache::offline() => {
+            let started = std::time::Instant::now();
+            match RemoteIndex::from_url_cached(&url) {
+                Ok(index) => {
+                    log::debug!(
+                        "Read {} remote symbol identifiers from {url} in {:?}",
+                        index.len(),
+                        started.elapsed()
+                    );
+                    Some(index)
+                }
+                Err(error) => {
+                    // An index that cannot be read is worth a line but not a
+                    // failed run: the local files may still answer.
+                    log::warn!("Could not read the remote symbol index at {url}: {error}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
+    if index.is_empty() && remote.as_ref().map(RemoteIndex::is_empty).unwrap_or(true) {
         log::debug!("No Linux symbol files are installed");
         return Ok(None);
     }
@@ -70,6 +99,7 @@ pub fn detect(
         }
         None => first_known_banner(context, physical_layer, BANNER_PREFIX, |banner| {
             index.lookup(banner).is_some()
+                || remote.as_ref().map(|remote| remote.knows(banner)).unwrap_or(false)
         })?
         .into_iter()
         .collect::<Vec<_>>(),
@@ -80,8 +110,33 @@ pub fn detect(
     }
 
     for found in &banners {
-        let Some(location) = index.lookup(&found.banner) else {
-            continue;
+        // A file on disk is preferred: it is already there and costs nothing.
+        // Only when nothing local describes this banner is the remote index
+        // asked, and only then is anything downloaded.
+        let location = match index.lookup(&found.banner) {
+            Some(location) => location.clone(),
+            None => {
+                let Some(remote) = remote.as_ref() else {
+                    continue;
+                };
+                let Some(urls) = remote
+                    .lookup(&found.banner)
+                    .or_else(|| remote.prefix_lookup(&found.banner))
+                else {
+                    log::info!(
+                        "The remote index does not describe '{}' either",
+                        found.banner
+                    );
+                    continue;
+                };
+                match remote_isf::download(urls, &found.banner) {
+                    Ok(location) => location,
+                    Err(error) => {
+                        log::warn!("Could not fetch symbols for '{}': {error}", found.banner);
+                        continue;
+                    }
+                }
+            }
         };
         log::info!(
             "Matched banner '{}' to symbols at {}",

@@ -10,6 +10,7 @@
 
 pub mod image_cache;
 pub mod pdbscan;
+pub mod remote_isf;
 pub mod stacker;
 pub mod windows;
 pub mod linux;

@@ -79,7 +79,7 @@ pub fn data_directory() -> Option<PathBuf> {
 }
 
 /// Decompress according to the file's extension.
-fn decompress(path: &Path, raw: Vec<u8>) -> Result<Vec<u8>> {
+pub fn decompress(path: &Path, raw: Vec<u8>) -> Result<Vec<u8>> {
     let name = path.to_string_lossy();
     let mut output = Vec::new();
 
