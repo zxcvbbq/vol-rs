@@ -162,30 +162,19 @@ impl Plugin for Maps {
     }
 }
 
-/// Extracts the complete data for a VMA as a file.
+/// Extracts the data between two addresses of a task's own address space.
 ///
-/// # Args
-///
-/// * `task` - a task_struct instance
-/// * `start` - The start virtual address from the vma to dump
-/// * `end` - The end virtual address from the vma to dump
-/// * `maxsize` - Max size of VMA section
-///
-/// # Returns
-///
-/// The name of the file written, or `None` in the case of failure. Pages the
-/// capture does not hold are written as zeros, so the file keeps the shape the
-/// mapping had.
-fn dump_vma(
+/// This is the same operation as dumping a VMA, but for a range that does not
+/// have to be one: the malfind plugin dumps the dirty page or region it called
+/// suspicious, which is frequently narrower than the mapping it sits in.
+pub fn dump_region(
     context: &Arc<Context>,
     task: &crate::framework::symbols::linux::Task,
     pid: u64,
-    vma: &crate::framework::symbols::linux::Vma,
+    start: u64,
+    end: u64,
     maxsize: u64,
 ) -> Value {
-    let (Ok(start), Ok(end)) = (vma.start(), vma.end()) else {
-        return Value::string("Error outputting file");
-    };
     let Ok(Some(layer)) = task.process_layer() else {
         return Value::string("Error outputting file");
     };
@@ -216,8 +205,8 @@ fn dump_vma(
     const CHUNK: u64 = 1024 * 1024 * 10;
     let mut offset = start;
     let mut complete = true;
-    while offset < start + size {
-        let take = CHUNK.min(start + size - offset);
+    while offset < end {
+        let take = CHUNK.min(end - offset);
         let Ok(piece) = context.layers.read(&layer, offset, take as usize, true) else {
             complete = false;
             break;
@@ -235,4 +224,31 @@ fn dump_vma(
     } else {
         Value::string("Error outputting file")
     }
+}
+
+/// Extracts the complete data for a VMA as a file.
+///
+/// # Args
+///
+/// * `task` - a task_struct instance
+/// * `start` - The start virtual address from the vma to dump
+/// * `end` - The end virtual address from the vma to dump
+/// * `maxsize` - Max size of VMA section
+///
+/// # Returns
+///
+/// The name of the file written, or `None` in the case of failure. Pages the
+/// capture does not hold are written as zeros, so the file keeps the shape the
+/// mapping had.
+fn dump_vma(
+    context: &Arc<Context>,
+    task: &crate::framework::symbols::linux::Task,
+    pid: u64,
+    vma: &crate::framework::symbols::linux::Vma,
+    maxsize: u64,
+) -> Value {
+    let (Ok(start), Ok(end)) = (vma.start(), vma.end()) else {
+        return Value::string("Error outputting file");
+    };
+    dump_region(context, task, pid, start, end, maxsize)
 }

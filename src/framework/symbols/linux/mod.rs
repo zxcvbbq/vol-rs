@@ -892,8 +892,16 @@ impl KernelModule {
         let letters = taint_letters(context, kernel, taints, true);
         Ok(letters
             .chars()
-            .filter_map(describe_taint)
-            .collect::<Vec<&str>>()
+            .filter_map(|letter| match describe_taint(letter) {
+                Some(description) => Some(description.to_string()),
+                // A letter that only marks a flag's absence describes nothing
+                // and is left out, but one this framework has never heard of is
+                // still named, so a kernel newer than the table does not hide a
+                // taint behind a blank column.
+                None if taint_is_known(letter) => None,
+                None => Some(format!("<UNKNOWN_TAINT_CHAR_{letter}>")),
+            })
+            .collect::<Vec<String>>()
             .join(","))
     }
 
@@ -2699,13 +2707,13 @@ impl Task {
             // Kernel 6.3 replaced the array of 32-bit words with a single
             // 64-bit `val` and renamed the structure to `kernel_cap_t`. A
             // table that already calls it that while still holding the words
-            // is one the reference implementation refuses to read at all,
-            // because it looks for the new member and nothing else.
+            // is one the reference implementation falls back on the older
+            // layout for, since `kernel_cap_t` is then only a typedef of
+            // `kernel_cap_struct`.
             if set.type_name().ends_with("kernel_cap_t") {
-                return set
-                    .member("val")
-                    .and_then(|value| value.as_u64())
-                    .map_err(|_| unsupported_capabilities());
+                if let Ok(value) = set.member("val").and_then(|value| value.as_u64()) {
+                    return Ok(value);
+                }
             }
             let words = set.member("cap").map_err(|_| unsupported_capabilities())?;
             match words.count() {
@@ -3249,12 +3257,29 @@ pub fn list_net_devices(
 /// unavailable rather than as 1970.
 pub fn boot_time_timespec(context: &Arc<Context>, kernel: &Module) -> Option<(i64, i64)> {
     // Kernels from 3.17 wrap the timekeeper in `tk_core`, and the difference
-    // between its two offsets is the boot instant. The symbol carries its own
-    // type, so no type name is supplied here.
-    if let Ok(timekeeper) = context
-        .object_from_symbol(kernel, "tk_core", None)
-        .and_then(|core| core.member("timekeeper"))
+    // between its two offsets is the boot instant. From 6.17 `tk_core` became a
+    // macro for the first entry of the `timekeeper_data` array, whose
+    // `TIMEKEEPER_CORE` enumerator is always 0, with or without
+    // CONFIG_POSIX_AUX_CLOCKS. The symbol carries its own type, so no type name
+    // is supplied here.
+    let core = if context
+        .symbol_space
+        .has_symbol(&kernel.qualified("timekeeper_data"))
     {
+        context
+            .object_from_symbol(kernel, "timekeeper_data", None)
+            .and_then(|data| data.index(0))
+            .ok()
+    } else if context
+        .symbol_space
+        .has_symbol(&kernel.qualified("tk_core"))
+    {
+        context.object_from_symbol(kernel, "tk_core", None).ok()
+    } else {
+        None
+    };
+
+    if let Some(timekeeper) = core.and_then(|core| core.member("timekeeper").ok()) {
         let read_ktime = |name: &str| -> Option<i64> {
             let field = timekeeper.member(name).ok()?;
             // Kernels before 4.10 wrap ktime_t in a union with a `tv64`.
@@ -3457,35 +3482,147 @@ pub fn taint_letters(
 }
 
 /// What each taint letter means: its bit, its letter, whether a module can
-/// carry it, and whether it is reported when present.
-const TAINT_FLAGS: &[(u64, char, bool, &str)] = &[
-    (1, 'P', true, "PROPRIETARY_MODULE"),
-    (2, 'F', false, "FORCED_MODULE"),
-    (4, 'S', false, "CPU_OUT_OF_SPEC"),
-    (8, 'R', false, "FORCED_RMMOD"),
-    (16, 'M', false, "MACHINE_CHECK"),
-    (32, 'B', false, "BAD_PAGE"),
-    (64, 'U', false, "USER"),
-    (128, 'D', false, "DIE"),
-    (256, 'A', false, "OVERRIDDEN_ACPI_TABLE"),
-    (512, 'W', false, "WARN"),
-    (1024, 'C', true, "CRAP"),
-    (2048, 'I', false, "FIRMWARE_WORKAROUND"),
-    (4096, 'O', true, "OOT_MODULE"),
-    (8192, 'E', true, "UNSIGNED_MODULE"),
-    (16384, 'L', false, "SOFTLOCKUP"),
-    (32768, 'K', true, "LIVEPATCH"),
-    (65536, 'X', true, "AUX"),
-    (131072, 'T', true, "RANDSTRUCT"),
-    (262144, 'N', true, "TEST"),
+/// carry it, whether it is described when present, and what it is called.
+///
+/// A letter whose description is `None` shares its bit with another letter and
+/// stands for the absence of that flag, so it is printed but never spelled out.
+const TAINT_FLAGS: &[(u64, char, bool, Option<&str>)] = &[
+    (1, 'P', true, Some("PROPRIETARY_MODULE")),
+    // The same bit, printed when the kernel is not tainted with it.
+    (1, 'G', true, None),
+    (2, 'F', false, Some("FORCED_MODULE")),
+    (4, 'S', false, Some("CPU_OUT_OF_SPEC")),
+    (8, 'R', false, Some("FORCED_RMMOD")),
+    (16, 'M', false, Some("MACHINE_CHECK")),
+    (32, 'B', false, Some("BAD_PAGE")),
+    (64, 'U', false, Some("USER")),
+    (128, 'D', false, Some("DIE")),
+    (256, 'A', false, Some("OVERRIDDEN_ACPI_TABLE")),
+    (512, 'W', false, Some("WARN")),
+    (1024, 'C', true, Some("CRAP")),
+    (2048, 'I', false, Some("FIRMWARE_WORKAROUND")),
+    (4096, 'O', true, Some("OOT_MODULE")),
+    (8192, 'E', true, Some("UNSIGNED_MODULE")),
+    (16384, 'L', false, Some("SOFTLOCKUP")),
+    (32768, 'K', true, Some("LIVEPATCH")),
+    (65536, 'X', true, Some("AUX")),
+    // Randomized structure layout is a property of the whole kernel build, not
+    // of an individual module, so it is not a per-module flag.
+    (131072, 'T', false, Some("RANDSTRUCT")),
+    (262144, 'N', true, Some("TEST")),
+    (524288, 'J', false, Some("FWCTL")),
 ];
 
 /// What a taint letter stands for, where it stands for anything.
+///
+/// `None` covers both a letter the table does not know and one that only marks
+/// a flag's absence; a caller that has to tell them apart checks the table.
 fn describe_taint(letter: char) -> Option<&'static str> {
     TAINT_FLAGS
         .iter()
         .find(|(_, candidate, _, _)| *candidate == letter)
-        .map(|(_, _, _, description)| *description)
+        .and_then(|(_, _, _, description)| *description)
+}
+
+/// Whether the table knows a letter at all.
+fn taint_is_known(letter: char) -> bool {
+    TAINT_FLAGS
+        .iter()
+        .any(|(_, candidate, _, _)| *candidate == letter)
+}
+
+#[cfg(test)]
+mod taint_tests {
+    use super::{describe_taint, taint_is_known, TAINT_FLAGS};
+
+    /// The letters a module is told apart by, for a set of taints.
+    fn module_letters(taints: u64) -> String {
+        TAINT_FLAGS
+            .iter()
+            .filter(|(_, _, module, _)| *module)
+            .filter(|(shift, _, _, _)| taints & shift != 0)
+            .map(|(_, letter, _, _)| *letter)
+            .collect()
+    }
+
+    /// The letters spelled out the way `taints_described` spells them: a letter
+    /// that only marks absence is dropped, an unknown one is named.
+    fn described(taints: u64) -> Vec<String> {
+        module_letters(taints)
+            .chars()
+            .filter_map(|letter| match describe_taint(letter) {
+                Some(description) => Some(description.to_string()),
+                None if taint_is_known(letter) => None,
+                None => Some(format!("<UNKNOWN_TAINT_CHAR_{letter}>")),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn randstruct_is_not_a_per_module_taint() {
+        // Randomized structure layout applies to the whole kernel build, so a
+        // module carrying that bit reports nothing.
+        assert!(!module_letters(1 << 17).contains('T'));
+    }
+
+    #[test]
+    fn the_letters_that_are_per_module_are_reported() {
+        let taints = (1 << 0) | (1 << 12) | (1 << 13) | (1 << 15) | (1 << 18);
+        // Bit 0 carries two letters, `P` and `G`, and the reference prints both
+        // when the bit is set even though only `P` describes anything.
+        assert_eq!(module_letters(taints), "PGOEKN");
+        // Spelled out, the shared bit yields one description, not two.
+        assert_eq!(
+            described(taints),
+            vec![
+                "PROPRIETARY_MODULE",
+                "OOT_MODULE",
+                "UNSIGNED_MODULE",
+                "LIVEPATCH",
+                "TEST"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_proprietary_module_describes_itself_once() {
+        assert_eq!(described(1), vec!["PROPRIETARY_MODULE"]);
+        assert!(described(0).is_empty());
+    }
+
+    #[test]
+    fn flags_only_the_kernel_can_carry_are_not_offered_to_modules() {
+        // A warning is a kernel-wide taint, and the framework knows it by a
+        // letter, but no module reports it.
+        assert!(describe_taint('W').is_some());
+        assert!(!module_letters(1 << 9).contains('W'));
+    }
+
+    #[test]
+    fn the_letter_for_an_absent_proprietary_module_describes_nothing() {
+        // `G` shares the proprietary bit and prints when it is clear; it is not
+        // a taint in its own right, so it is spelled out as nothing.
+        assert!(describe_taint('G').is_none());
+        assert!(taint_is_known('G'));
+        assert!(describe_taint('J').is_some());
+    }
+
+    #[test]
+    fn a_letter_the_table_does_not_know_is_still_named() {
+        assert!(!taint_is_known('Z'));
+        assert_eq!(described(1 << 30), Vec::<String>::new());
+        // The unknown-letter path only fires for a letter the kernel table
+        // produced, which the static table never would.
+        let unknown: Vec<String> = "Z"
+            .chars()
+            .filter_map(|letter| match describe_taint(letter) {
+                Some(description) => Some(description.to_string()),
+                None if taint_is_known(letter) => None,
+                None => Some(format!("<UNKNOWN_TAINT_CHAR_{letter}>")),
+            })
+            .collect();
+        assert_eq!(unknown, vec!["<UNKNOWN_TAINT_CHAR_Z>"]);
+    }
 }
 
 #[cfg(test)]

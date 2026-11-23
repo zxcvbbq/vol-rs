@@ -775,6 +775,164 @@ fn page_flag_names(context: &Arc<Context>, kernel: &Module, flags: u64) -> Vec<S
         .collect()
 }
 
+/// The flags of a `struct page`, as a bitfield.
+///
+/// The kernel replaced the bare `unsigned long flags` with `memdesc_flags_t`,
+/// whose single member `f` holds the bits, so a page either carries the flags
+/// directly or nests them one member down.
+fn page_flags(page: &Object) -> u64 {
+    let Ok(flags) = page.member("flags") else {
+        return 0;
+    };
+    flags
+        .member("f")
+        .and_then(|inner| inner.as_u64())
+        .or_else(|_| flags.as_u64())
+        .unwrap_or(0)
+}
+
+/// The page's index within its file.
+///
+/// A 2025 change moved the index beside the folio's other fields and renamed it
+/// `__folio_index`. Both names are tried, since the rename left nothing behind
+/// under the old one.
+fn page_index(page: &Object) -> u64 {
+    page.member("__folio_index")
+        .and_then(|index| index.as_u64())
+        .or_else(|_| page.member("index").and_then(|index| index.as_u64()))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{page_flags, page_index};
+    use crate::framework::context::{Context, Module};
+    use crate::framework::layers::physical::BufferLayer;
+    use crate::framework::objects::Object;
+    use crate::framework::symbols::isf::IsfFile;
+    use crate::framework::symbols::native::x64_native_table;
+    use crate::framework::symbols::SymbolTable;
+    use std::sync::Arc;
+
+    /// An image holding one `struct page`, and a kernel describing it.
+    fn page_object(fields: &str, values: &[u8]) -> (Arc<Context>, Object) {
+        page_object_with_types("", fields, values)
+    }
+
+    /// The same, with any types the page's definition refers to.
+    fn page_object_with_types(
+        extra_types: &str,
+        fields: &str,
+        values: &[u8],
+    ) -> (Arc<Context>, Object) {
+        let isf = format!(
+            r#"{{
+                "metadata": {{"format": "6.2.0"}},
+                "base_types": {{
+                    "pointer": {{"size": 8, "signed": false, "kind": "int", "endian": "little"}},
+                    "int": {{"size": 4, "signed": true, "kind": "int", "endian": "little"}},
+                    "unsigned long": {{"size": 8, "signed": false, "kind": "int", "endian": "little"}}
+                }},
+                "user_types": {{
+                    {extra_types}
+                    "page": {{"kind": "struct", "size": 64, "fields": {fields}}}
+                }},
+                "enums": {{}},
+                "symbols": {{}}
+            }}"#
+        );
+
+        let mut memory = vec![0u8; 0x1000];
+        memory[..values.len()].copy_from_slice(values);
+        let context = Arc::new(Context::new());
+        context.layers.add(Arc::new(BufferLayer::new("kernel", memory)));
+        let parsed = IsfFile::from_slice(isf.as_bytes()).unwrap();
+        context.add_symbol_table(Arc::new(SymbolTable::new(
+            "vmlinux",
+            parsed,
+            x64_native_table(),
+        )));
+        let _module: Arc<Module> = context.add_module(
+            Module::new("kernel", "vmlinux", "kernel", 0).with_absolute_addresses(true),
+        );
+
+        let object = context.object("vmlinux!page", "kernel", 0).unwrap();
+        (context, object)
+    }
+
+    #[test]
+    fn an_older_page_keeps_its_index_directly() {
+        // The stored index is read where the type says it is.
+        let mut values = vec![0u8; 16];
+        values[8..16].copy_from_slice(&7u64.to_le_bytes());
+
+        let (_context, page) = page_object(
+            r#"{"index": {"offset": 8, "type": {"kind": "base", "name": "unsigned long"}}}"#,
+            &values,
+        );
+        assert_eq!(page_index(&page), 7);
+    }
+
+    #[test]
+    fn a_folio_page_reports_its_index_under_the_new_name() {
+        let mut values = vec![0u8; 16];
+        values[8..16].copy_from_slice(&9u64.to_le_bytes());
+        let (_context, page) = page_object(
+            r#"{"__folio_index": {"offset": 8, "type": {"kind": "base", "name": "unsigned long"}}}"#,
+            &values,
+        );
+        assert_eq!(page_index(&page), 9);
+    }
+
+    #[test]
+    fn the_new_name_is_preferred_where_both_are_present() {
+        let mut values = vec![0u8; 24];
+        values[8..16].copy_from_slice(&11u64.to_le_bytes());
+        values[16..24].copy_from_slice(&3u64.to_le_bytes());
+        let (_context, page) = page_object(
+            r#"{
+                "__folio_index": {"offset": 8, "type": {"kind": "base", "name": "unsigned long"}},
+                "index": {"offset": 16, "type": {"kind": "base", "name": "unsigned long"}}
+            }"#,
+            &values,
+        );
+        assert_eq!(page_index(&page), 11);
+    }
+
+    #[test]
+    fn memdesc_flags_are_read_from_the_nested_member() {
+        let mut values = vec![0u8; 8];
+        values[..8].copy_from_slice(&0x21u64.to_le_bytes());
+        // `flags` is a struct of its own, carrying the bits in `f`.
+        let (_context, page) = page_object_with_types(
+            r#""memdesc_flags_t": {"kind": "struct", "size": 8, "fields": {
+                    "f": {"offset": 0, "type": {"kind": "base", "name": "unsigned long"}}
+                }},"#,
+            r#"{"flags": {"offset": 0, "type": {"kind": "struct", "name": "memdesc_flags_t"}}}"#,
+            &values,
+        );
+        assert_eq!(page_flags(&page), 0x21);
+    }
+
+    #[test]
+    fn an_older_page_keeps_its_flags_directly() {
+        let mut values = vec![0u8; 8];
+        values[..8].copy_from_slice(&0x44u64.to_le_bytes());
+        let (_context, page) = page_object(
+            r#"{"flags": {"offset": 0, "type": {"kind": "base", "name": "unsigned long"}}}"#,
+            &values,
+        );
+        assert_eq!(page_flags(&page), 0x44);
+    }
+
+    #[test]
+    fn a_page_without_flags_reports_none() {
+        let (_context, page) = page_object(r#"{}"#, &[0u8; 8]);
+        assert_eq!(page_flags(&page), 0);
+        assert_eq!(page_index(&page), 0);
+    }
+}
+
 /// The pages an inode currently has cached.
 ///
 /// The second value says whether the walk was cut short by a page the capture
@@ -858,19 +1016,12 @@ fn cached_pages(
             virtual_address: address,
             physical_address,
             mapping: owner,
-            index: page
-                .member("index")
-                .and_then(|index| index.as_u64())
-                .unwrap_or(0),
-            flags: page_flag_names(
-                context,
-                kernel,
-                page.member("flags").and_then(|f| f.as_u64()).unwrap_or(0),
-            )
-            .into_iter()
-            .map(|name| name.replace("PG_", ""))
-            .collect::<Vec<String>>()
-            .join(","),
+            index: page_index(&page),
+            flags: page_flag_names(context, kernel, page_flags(&page))
+                .into_iter()
+                .map(|name| name.replace("PG_", ""))
+                .collect::<Vec<String>>()
+                .join(","),
         });
     }
     (pages, false)

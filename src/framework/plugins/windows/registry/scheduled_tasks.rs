@@ -917,9 +917,7 @@ impl Plugin for ScheduledTasks {
     }
 
     fn requirements(&self) -> Vec<Requirement> {
-        // The architectures upstream lists carry a typo for the 32-bit one, so
-        // a 32-bit image satisfies neither and the requirement goes unmet.
-        vec![Requirement::kernel().for_architectures(&["Intel33", "Intel64"])]
+        vec![Requirement::kernel().for_architectures(&["Intel32", "Intel64"])]
     }
 
     fn operating_system(&self) -> OperatingSystem {

@@ -253,7 +253,10 @@ impl Plugin for Timeliner {
 
                 if bodyfile {
                     // Writing the body file takes the entry's own timestamps,
-                    // which then become the ones the next row is written with.
+                    // and they are never reset, so the row after this one is
+                    // written with them. Every row but the first is therefore
+                    // framed by the entry before it, which is what the
+                    // reference implementation does.
                     last = times.clone();
                     // A kind of timestamp the plugin never mentioned counts as
                     // something to write, which is how the reference

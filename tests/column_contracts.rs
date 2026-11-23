@@ -521,12 +521,12 @@ const EXPECTED: &[(&str, &[&str])] = &[
         &["Address", "Module", "Symbol"],
     ),
     (
-        // Volatility 2.28.2 adds a "File output" column here. 2.28.0, which is
-        // the release this port is compared against, does not.
+        // Volatility 2.28.3 adds a "File output" column and the region dumping
+        // options that go with it.
         "linux.malware.malfind.Malfind",
         &[
             "PID", "Process", "Start", "End", "Path", "Protection", "Hexdump",
-            "Disasm",
+            "Disasm", "File output",
         ],
     ),
     (

@@ -350,10 +350,19 @@ fn check_kernel_offset(
         Some(address + MAX_PDB_SIZE),
     )
     .ok()?;
-    found.into_iter().next().map(|candidate| ValidKernel {
-        virtual_offset: address,
-        candidate,
-    })
+    // The scan window can extend past this image into the next one: hal.dll
+    // sits just below ntoskrnl, so scanning from hal.dll's header reaches the
+    // kernel PDB belonging to ntoskrnl. Accepting that would make hal.dll's
+    // address the kernel base and shift every symbol, leaving the process
+    // listings empty, so only a record whose own image starts at the address
+    // being checked counts.
+    found
+        .into_iter()
+        .find(|candidate| candidate.mz_offset == Some(address))
+        .map(|candidate| ValidKernel {
+            virtual_offset: address,
+            candidate,
+        })
 }
 
 /// The kernel address recorded in the processor start block.
@@ -584,5 +593,47 @@ mod tests {
         assert_eq!(record.pdb_name, "ntkrnlmp.pdb");
         assert_eq!(record.symbol_file_name(), "89284D0CA6ACC8274B9A44BD5AF9290B-1");
         assert_eq!(record.symbol_directory(), "windows/ntkrnlmp.pdb");
+    }
+
+    /// An MZ header at `address` and a kernel PDB record further along, with
+    /// nothing in between but the record.
+    fn image_with_record(record_at: u64) -> Vec<u8> {
+        let mut data = vec![0u8; 0x20_0000];
+        data[0x1000..0x1002].copy_from_slice(b"MZ");
+        data[0x4000..0x4002].copy_from_slice(b"MZ");
+        let mut record = b"RSDS".to_vec();
+        record.extend_from_slice(&[
+            0x0C, 0x4D, 0x28, 0x89, 0xAC, 0xA6, 0x27, 0xC8, 0x4B, 0x9A, 0x44, 0xBD, 0x5A, 0xF9,
+            0x29, 0x0B,
+        ]);
+        record.extend_from_slice(&1u32.to_le_bytes());
+        record.extend_from_slice(b"ntkrnlmp.pdb\0");
+        let at = record_at as usize;
+        data[at..at + record.len()].copy_from_slice(&record);
+        data
+    }
+
+    /// A record reached from hal.dll's header but belonging to the kernel above
+    /// it must not make hal.dll's address the kernel base.
+    #[test]
+    fn a_record_belonging_to_the_next_image_is_not_attributed_to_this_one() {
+        use crate::framework::layers::physical::BufferLayer;
+
+        let context = Arc::new(Context::new());
+        // The record sits past the second MZ, so a scan from the first header
+        // reaches it while its own image starts at 0x4000.
+        let data = image_with_record(0x8000);
+        let layer = BufferLayer::new("memory", data);
+        context.layers.add(Arc::new(layer));
+
+        // The scan from hal.dll's header finds the kernel's record, which
+        // belongs to 0x4000 rather than to 0x1000.
+        let found = pdbname_scan(&context, "memory", 0x1000, Some(0x1000 + MAX_PDB_SIZE))
+            .expect("the scan should run");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].mz_offset, Some(0x4000));
+
+        // So the address being checked is not accepted as a kernel base.
+        assert!(kernel_at(&context, "memory", 0x1000).is_none());
     }
 }

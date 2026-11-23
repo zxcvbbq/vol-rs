@@ -248,23 +248,24 @@ pub fn paging_at(context: &Arc<Context>, layer_name: &str, dtb: u64) -> Option<&
 /// its own places to look.
 ///
 /// Where the DTB scan fails, upstream attempts a heuristic of checking for the
-/// DTB within a specific range. New versions of windows, with randomized
-/// self-referential pointers, appear to always load their dtb within a small
-/// specific range (`0x1a0000` and `0x1b0000`), so instead we scan for all
-/// self-referential pointers in that range, and ignore any that contain
+/// DTB within a set of physical address ranges. New versions of windows, with
+/// randomized self-referential pointers, appear to always load their dtb within
+/// observed ranges near the start of physical memory, so instead we scan for
+/// all self-referential pointers in those ranges, and ignore any that contain
 /// multiple self-references (since the DTB is very unlikely to point to itself
 /// more than once).
 ///
+/// The three ranges upstream once kept separate left two gaps, at
+/// `0x2a0000`--`0x550000` and `0x6f0000`--`0x900000`. A Windows 11 25H2 image
+/// places its System DTB at `0x7b5000`, inside the second gap, which made every
+/// plugin fail, so the ranges are now one contiguous span ending at `0xa00000`,
+/// where the large-memory range begins. Widening the search is safe because a
+/// candidate is validated by translation before it is used, so extra candidates
+/// cost scan time and nothing else.
+///
 /// The tests are grouped by region so we only run over the data once.
 const SEARCHES: &[(&[&SelfReferenceTest], &[(u64, u64)])] = &[
-    (
-        &[&TEST_64],
-        &[
-            (0x150000, 0x150000),
-            (0x550000, 0x1A0000),
-            (0x900000, 0x100000),
-        ],
-    ),
+    (&[&TEST_64], &[(0x150000, 0x8B0000)]),
     (
         &[&TEST_PAE, &TEST_32, &TEST_64_LEGACY],
         &[(0x30000, 0x100_0000)],

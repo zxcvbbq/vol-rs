@@ -2,6 +2,39 @@
 
 A port of the Volatility 3 memory forensics framework from Python to Rust. It reads the same memory images, runs the same plugins with the same options, and prints the same output, byte for byte, a good deal faster.
 
+This is [**zxcvbbq**'s fork](https://github.com/zxcvbbq/vol-rs) of [daffainfo/vol-rs](https://github.com/daffainfo/vol-rs). It tracks upstream Volatility 3 through **2.28.3** and carries fixes for kernels and Windows builds that the port did not yet handle. See [What this fork adds](#what-this-fork-adds).
+
+## What this fork adds
+
+The port was matched against Volatility **2.28.0**. Upstream has since moved to 2.28.3, and several of those changes were fixes for images this port could not analyse correctly. Each one below was ported from the upstream source rather than guessed at.
+
+### Linux
+
+| Change | Effect |
+|---|---|
+| Boot time from `timekeeper_data` (6.17+) | `tk_core` became a macro over `timekeeper_data[TIMEKEEPER_CORE]`. Without this, every task timestamp on a 6.17+ kernel was wrong or unavailable. |
+| `page.__folio_index` | A 2025 folio change renamed `page.index`. Cached-page indexes read as zero, so file recovery laid pages out at the wrong offsets. |
+| `memdesc_flags_t` | Page `flags` are now wrapped in a struct with the bits in `.f`. Flags read as blank. |
+| `kernel_cap_t` before 6.3 | Before 6.3 `kernel_cap_t` is a typedef of the older two-word structure. The port raised `Unsupported kernel capabilities implementation`; both layouts are now read. |
+| Taint table | `RANDSTRUCT` is no longer a per-module flag, `FWCTL` and the `G` letter were missing, and letters the table does not know are now named `<UNKNOWN_TAINT_CHAR_x>` instead of being dropped silently. |
+| `linux.malfind` | Rewritten to upstream's current algorithm: `--dump-regions` with a `File output` column, `--show-all-dirty-pages`, `--hexdump-size` and `--dump-maxsize`, and per-address page sizing so large pages are not re-walked once per 4 KiB. |
+
+### Windows
+
+| Change | Effect |
+|---|---|
+| Contiguous DTB search range | The fast path was three ranges with two gaps. A Windows 11 25H2 System DTB at `0x7b5000` fell inside a gap, which made **every** plugin fail on that image. |
+| Kernel base attribution | Scanning from `hal.dll`'s header reached the PDB of the ntoskrnl above it and used hal's address as the kernel base, shifting every symbol by `0x48000` and leaving `pslist` empty. A record now only counts when its own image starts at the address being checked. |
+| `scheduled_tasks` architecture | The requirement listed `Intel33` instead of `Intel32`, so the plugin could never run on a 32-bit image. |
+
+### Verified
+
+- **197 of 197 plugin help pages are byte-identical to Volatility 2.28.3**, including the nine plugins that changed above.
+- 169 unit tests pass, 13 of them new and covering the kernel-base attribution bug, both page layouts, and the taint semantics.
+- The Linux and Windows fixes were written from the upstream diffs and checked against upstream's own behaviour where it could be exercised locally.
+
+There are no memory captures on the machine this fork was prepared on, so the tables below are the original author's measurements, not re-run here. The fixes above are verified at the source and unit-test level rather than against fresh captures. That is the honest state of it, and the [To do](#to-do) list is where to push next.
+
 ## License
 
 This project is a port of Volatility 3 and is therefore an "Addition" under the Volatility Software License 1.0, so it is published under that same license. The full text is in [LICENSE](LICENSE) and online at https://www.volatilityfoundation.org/license/vsl-v1.0. Every source file keeps the notice recording what it was derived from.
@@ -30,13 +63,26 @@ The binary lands at `target/release/vol-rs`. Nothing optional is needed. Symbol 
 
 Every option the Python version takes is taken here too, with the same names and the same defaults, including `-o`, `-r`, `-s`, `-c`, `-e`, `--filters`, `--hide-columns`, `--save-config`, `--stackers` and `--single-swap-locations`. Each plugin's own options match as well, which the help pages show: all 197 of them are identical to the Python ones, character for character.
 
+### New in this fork
+
+```
+# Dump the suspicious region for each hit, not just its first 64 bytes.
+./target/release/vol-rs -f memory.lime linux.malfind.Malfind --dump-regions
+
+# Report every dirtied page in an executable mapping, not just the first.
+./target/release/vol-rs -f memory.lime linux.malfind.Malfind --show-all-dirty-pages
+
+# Show more of each region.
+./target/release/vol-rs -f memory.lime linux.malfind.Malfind --hexdump-size 256
+```
+
 ## Symbols
 
 Symbol packs go in `$XDG_DATA_HOME/vol-rs/symbols`, or `~/.local/share/vol-rs/symbols` when that variable is not set. A pack somewhere else is named with `--symbol-dirs` or through the `VOLRS_SYMBOL_PATH` environment variable. A Windows kernel that no pack describes is looked up on the Microsoft symbol server, and the database found there is turned into a symbol file and kept, so the fetch happens once. The database itself is cached under `~/.cache/vol-rs` and the symbol file is written beside the packs.
 
 ## What has been checked
 
-Both sides were run against the same captures and diffed, header framing and trailing newlines included:
+These are the original author's measurements against Volatility 2.28.0. Both sides were run against the same captures and diffed, header framing and trailing newlines included:
 
 | Capture | Plugins run | Identical |
 |---|---:|---:|
@@ -46,12 +92,12 @@ Both sides were run against the same captures and diffed, header framing and tra
 | Windows XP, 512 MB raw capture | 114 | 113 |
 | Linux 3.2, 512 MB raw capture | 60 | 60 |
 
-The eight plugins that take a pattern or a rule were given one, the same on both sides, rather than left out. Three of the differences found that way were defects in this port and are fixed.
+The eight plugins that take a pattern or a rule were given one, the same on both sides, rather than left out. Three of the differences found that way were defects in the port and are fixed.
 
 | Other check | Result |
 |---|---|
 | Files written by extracting plugins | 24,441 compared, every one equal |
-| Plugin help pages | 197 of 197 identical |
+| Plugin help pages | 197 of 197 identical against 2.28.3 (re-checked for this fork) |
 | Renderers | `csv`, `json`, `jsonl`, `quick` and `pretty` compared on several plugins, all identical |
 
 Instructions are decoded by the same library the Python version uses, compiled in at version 5.0.6, which is the version the reference was pinned to for these comparisons. Version 5.0.7 decodes one more instruction form, which changes how about two percent of `windows.mbrscan`'s lines are spelled on the Windows 10 capture and nothing else.
@@ -173,6 +219,7 @@ These differ because the Python version ends early and this port does not. Every
 
 Everything below is ported and builds, but has not been run against real evidence yet:
 
+- [ ] Run the 2.28.3 fixes against real captures. The 6.17+ boot time, the folio page index and flags, pre-6.3 capabilities, the Windows 11 25H2 DTB range and the kernel-base attribution fix are all verified at source level and by unit test, but no image exercising them has been through this fork yet. This is the first thing to do.
 - [ ] Test the 23 macOS plugins against a real Mac capture. All 23 were read line by line against the Python source, and every type, member and symbol they touch was checked against the 129 published Darwin symbol files covering 10.6 to 10.15, so the version fallbacks are known to be complete. What is left is a real Mac image to run them on.
 - [ ] Test the remaining image formats. Raw, VMware, LiME and Windows crash dump captures have all been used, so the AVML, QEMU, ELF core and Xen layers are the ones still unproven on real files.
 - [ ] Test more kernel versions. Windows XP, Windows 10 19041 and 19045, Windows 11 24H2, Linux 3.2, Ubuntu 22.04 on 6.5 and Linux 6.8 is still a narrow base, and plugins that read version specific structures are where a port is most likely to drift.
@@ -180,4 +227,4 @@ Everything below is ported and builds, but has not been run against real evidenc
 
 ## Credit
 
-Volatility 3 is the work of the Volatility Foundation and its contributors. This is a port of their design, their plugin set and their output format, and it exists because that work is open.
+Volatility 3 is the work of the Volatility Foundation and its contributors. The Rust port is [daffainfo](https://github.com/daffainfo/vol-rs)'s. This fork carries upstream 2.28.3 fixes forward onto that port; it is their design, their plugin set and their output format throughout, and it exists because that work is open.

@@ -739,6 +739,22 @@ impl IntelLayer {
             .unwrap_or(false)
     }
 
+    /// The size of the contiguous run the address sits in.
+    ///
+    /// This is the layer's page size except where a large page (PUD, PMD) maps
+    /// the address, in which case it is that page's size. Callers stepping
+    /// through a range use it so a large page is visited once rather than once
+    /// per small page inside it. An address whose entry is absent is reported
+    /// at the layer's own page size, which is what the reference implementation
+    /// falls back to when its translation raises.
+    pub fn translate_size(&self, layers: &LayerContainer, offset: u64) -> Option<u64> {
+        let entry = self.translate_entry(layers, offset & self.page_mask()).ok()?;
+        if !self.page_is_valid(entry.entry) {
+            return Some(self.page_size());
+        }
+        Some(1u64 << (entry.position + 1))
+    }
+
     /// Translate a single address, returning the physical offset and the layer
     /// it lands in.
     pub fn translate_single(&self, layers: &LayerContainer, offset: u64) -> Result<(u64, String)> {
